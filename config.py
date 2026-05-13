@@ -1,5 +1,13 @@
 import os
 
+# Load .env from the project directory at import time so config can read it.
+# Silently skipped if python-dotenv isn't installed (the env var still works).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 # === JARVIS Configuration ===
 # Originally: V.O.I.D — Voice Operated Intelligent Daemon
 
