@@ -1,0 +1,7 @@
+faster-whisper
+openwakeword
+sounddevice
+numpy
+piper-tts
+google-generativeai
+pygame

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+*.egg-info/
+
+# Models — too large, fetched by setup.sh
+models/
+
+# Runtime logs (regenerated each session)
+jarvis.log
+jarvis.log.*
+
+# Secrets
+.env
+.env.local
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
