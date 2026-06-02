@@ -51,3 +51,12 @@ CONTEXT_MAX_TURNS = 6      # Keep at most N user+model exchanges (older ones dro
 # Assistant identity
 ASSISTANT_NAME = "Jarvis"
 GREETING = "Jarvis is ready. Say Hey Jarvis to give me a command."
+
+# Floating face overlay
+OVERLAY_SIZE = int(os.environ.get("OVERLAY_SIZE", "360"))   # square canvas, px
+OVERLAY_MARGIN = int(os.environ.get("OVERLAY_MARGIN", "24"))  # gap from screen edge for first launch
+# Pure passthrough "movie" mode: clicks fully pass through, overlay is NOT draggable.
+# Off by default so you can grab and drag the brain by its disc.
+OVERLAY_CLICK_THROUGH = os.environ.get("OVERLAY_CLICK_THROUGH", "0") == "1"
+# Saved drag position (written when you move the overlay). Deleted -> back to default corner.
+OVERLAY_POS_FILE = os.path.join(PROJECT_DIR, ".overlay_pos.json")

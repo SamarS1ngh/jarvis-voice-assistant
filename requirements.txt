@@ -5,4 +5,5 @@ numpy
 piper-tts
 google-generativeai
 pygame
+PySide6
 python-dotenv

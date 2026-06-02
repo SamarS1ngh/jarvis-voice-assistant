@@ -15,6 +15,9 @@ models/
 jarvis.log
 jarvis.log.*
 
+# Saved overlay drag position
+.overlay_pos.json
+
 # Secrets
 .env
 .env.local

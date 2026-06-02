@@ -25,7 +25,8 @@ sudo apt install -y \
     gnome-screenshot \
     alsa-utils \
     pulseaudio-utils \
-    ffmpeg
+    ffmpeg \
+    libxcb-cursor0   # required by the Qt (PySide6) overlay on XWayland
 
 # ydotool note: on Wayland, ydotool needs a running daemon and your user
 # in the 'input' group. One-time setup:

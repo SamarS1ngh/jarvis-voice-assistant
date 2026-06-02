@@ -5,6 +5,7 @@ Originally: V.O.I.D — Voice Operated Intelligent Daemon
 
 import sys
 import signal
+import threading
 
 from jarvis_log import log, LOG_PATH
 from wake_word import WakeWordDetector
@@ -46,9 +47,9 @@ def main():
     else:
         print("Gemini smart mode: DISABLED (set GEMINI_API_KEY in config.py)")
 
-    # Start the face widget
+    # The face widget owns the main thread (Qt requirement); the assistant runs
+    # in a worker thread.
     face = FaceWidget()
-    face.start()
     face.set_state("idle")
 
     print()
@@ -56,77 +57,83 @@ def main():
     print("Press Ctrl+C to exit.")
     print()
 
-    # Speak greeting
-    face.set_state("speaking")
-    speaker.speak(config.GREETING)
-    face.set_state("idle")
+    def assistant_loop():
+        # Speak greeting
+        face.set_state("speaking")
+        speaker.speak(config.GREETING)
+        face.set_state("idle")
 
-    # Graceful shutdown
+        # Main loop — stream mic audio continuously
+        print("🔇 Idle — waiting for wake word...")
+        for audio_chunk in listener.listen_for_wake_word():
+            if not face._running:
+                break
+            try:
+                if detector.detect(audio_chunk):
+                    # Wake word detected
+                    face.set_state("listening")
+                    print("\n🎤 LISTENING — speak your command...")
+                    beep_listening()
+
+                    # Record the command
+                    audio = listener.record_until_silence()
+
+                    # Done recording
+                    face.set_state("processing")
+                    beep_processing()
+                    print("⚙️  PROCESSING...")
+
+                    if len(audio) == 0:
+                        beep_error()
+                        face.set_state("speaking")
+                        speaker.speak("I didn't hear anything.")
+                        face.set_state("idle")
+                        print("🔇 Idle — waiting for wake word...")
+                        continue
+
+                    # Transcribe
+                    text = transcriber.transcribe(audio)
+                    print(f"📝 Heard: '{text}'")
+                    log.info(f"HEARD: {text!r}")
+
+                    if not text:
+                        beep_error()
+                        face.set_state("speaking")
+                        speaker.speak("I didn't catch that.")
+                        face.set_state("idle")
+                        print("🔇 Idle — waiting for wake word...")
+                        continue
+
+                    # Process command
+                    response = commander.process(text)
+                    if response:
+                        face.set_state("speaking")
+                        speaker.speak(response)
+
+                    # Reset detector after processing
+                    face.set_state("idle")
+                    detector.reset()
+                    print("🔇 Idle — waiting for wake word...")
+
+            except Exception as e:
+                print(f"Error: {e}")
+                log.exception(f"Main loop error: {e}")
+                continue
+
+    # Graceful shutdown — stop the Qt loop so run() returns on the main thread.
     def shutdown(sig, frame):
-        # print("\nShutting down V.O.I.D...")
         print("\nShutting down J.A.R.V.I.S...")
-        face.stop()
-        speaker.speak("Goodbye.")
-        sys.exit(0)
+        face.quit()
 
     signal.signal(signal.SIGINT, shutdown)
 
-    # Main loop — stream mic audio continuously
-    print("🔇 Idle — waiting for wake word...")
-    for audio_chunk in listener.listen_for_wake_word():
-        try:
-            if detector.detect(audio_chunk):
-                # Wake word detected
-                face.set_state("listening")
-                print("\n🎤 LISTENING — speak your command...")
-                beep_listening()
+    threading.Thread(target=assistant_loop, daemon=True).start()
 
-                # Record the command
-                audio = listener.record_until_silence()
+    # Blocks on the main thread, running the overlay event loop.
+    face.run()
 
-                # Done recording
-                face.set_state("processing")
-                beep_processing()
-                print("⚙️  PROCESSING...")
-
-                if len(audio) == 0:
-                    beep_error()
-                    face.set_state("speaking")
-                    speaker.speak("I didn't hear anything.")
-                    face.set_state("idle")
-                    print("🔇 Idle — waiting for wake word...")
-                    continue
-
-                # Transcribe
-                text = transcriber.transcribe(audio)
-                print(f"📝 Heard: '{text}'")
-                log.info(f"HEARD: {text!r}")
-
-                if not text:
-                    beep_error()
-                    face.set_state("speaking")
-                    speaker.speak("I didn't catch that.")
-                    face.set_state("idle")
-                    print("🔇 Idle — waiting for wake word...")
-                    continue
-
-                # Process command
-                response = commander.process(text)
-                if response:
-                    face.set_state("speaking")
-                    speaker.speak(response)
-
-                # Reset detector after processing
-                face.set_state("idle")
-                detector.reset()
-                print("🔇 Idle — waiting for wake word...")
-
-        except KeyboardInterrupt:
-            shutdown(None, None)
-        except Exception as e:
-            print(f"Error: {e}")
-            log.exception(f"Main loop error: {e}")
-            continue
+    speaker.speak("Goodbye.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
