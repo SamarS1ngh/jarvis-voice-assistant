@@ -27,6 +27,7 @@ import subprocess
 import threading
 import time
 
+import numpy as np
 import pygame
 
 import config
@@ -47,8 +48,11 @@ WIDTH = HEIGHT = config.OVERLAY_SIZE
 FPS = 60
 SCREEN_MARGIN = config.OVERLAY_MARGIN   # gap from the screen edge for the default position
 
-NUM_PARTICLES = 120
-NUM_TENDRILS = 8
+NUM_PARTICLES = 70          # fine "dust" motes
+NUM_NEURONS = 44            # nodes of the synaptic mesh
+CONNECT_DIST_FRAC = 0.34    # neurons closer than this (× sphere span) wire up
+MEMBRANE_POINTS = 96        # resolution of the organic membrane ring
+NUM_TENDRILS = 8            # retained for the standalone Tendril class
 TENDRIL_POINTS = 30
 
 # State colour palettes  (r, g, b)
@@ -156,16 +160,276 @@ class Tendril:
 
 
 class CoreGlow:
-    """Central glowing core."""
+    """Bright central nucleus — a pixel-smooth radial gradient (numpy), so there
+    is no concentric banding or hard edge."""
 
-    def draw(self, surface, cx, cy, color, pulse):
-        for r_mult in [0.7, 0.5, 0.3, 0.15]:
-            radius = int(30 * (1 + pulse * 0.5) * (1.0 / (r_mult + 0.3)))
-            alpha = r_mult * 0.25
-            c = tuple(int(v * alpha) for v in color)
-            glow_surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
-            pygame.draw.circle(glow_surf, (*c, int(255 * alpha * 0.4)), (radius, radius), radius)
-            surface.blit(glow_surf, (cx - radius, cy - radius), special_flags=pygame.BLEND_ADD)
+    def __init__(self):
+        self._cache = {}   # radius -> (rgba float falloff)
+
+    def _falloff(self, R):
+        f = self._cache.get(R)
+        if f is None:
+            yy, xx = np.ogrid[-R:R, -R:R]
+            d = np.sqrt(xx * xx + yy * yy) / R
+            # circular 0..1 (1 at centre), HARD zero past the radius -> round, not square
+            f = (np.clip(1.0 - d, 0.0, 1.0) ** 1.7).T   # .T: ogrid [y][x] -> surfarray [x][y]
+            self._cache[R] = f
+        return f
+
+    def draw(self, surface, cx, cy, color, pulse, t):
+        # Own steady breath so the nucleus visibly pulsates even when idle.
+        breath = 0.5 + 0.5 * math.sin(t * 2.2)
+        R = int((28 + pulse * 6) * (1 + breath * 0.30))   # bigger base + size pulse
+        bright = 0.75 + 0.45 * breath                      # brightness pulse
+        falloff = self._falloff(R)
+        # BLEND_ADD adds RGB (ignores alpha), so bake the radial gradient into the
+        # colour channels; outside the radius falloff is 0 -> adds nothing.
+        g = np.stack([np.clip(color[ch] * falloff * bright, 0, 255) for ch in range(3)],
+                     axis=-1).astype(np.uint8)
+        glow = pygame.surfarray.make_surface(g)   # unlocked surface, safe to blit
+        surface.blit(glow, (cx - R, cy - R), special_flags=pygame.BLEND_ADD)
+
+
+class NeuralMesh:
+    """A living web of neurons orbiting the sphere, wiring up when they drift
+    close together — the synaptic body of the organism."""
+
+    def __init__(self, radius):
+        self.radius = radius
+        self.connect_dist = radius * 2 * CONNECT_DIST_FRAC
+        self.nodes = [Particle(radius) for _ in range(NUM_NEURONS)]
+        # Each neuron carries its own firing flicker so the mesh shimmers.
+        for n in self.nodes:
+            n.size = random.uniform(2.0, 3.6)
+            n.fire_phase = random.uniform(0, 2 * math.pi)
+        self.edges = []   # (i, j) pairs that are currently wired — refreshed per frame
+
+    def update(self, dt, chaos, pulse):
+        for n in self.nodes:
+            n.update(dt, chaos, pulse)
+        # Rebuild the active connection list from current screen positions.
+        self.edges = []
+        d2max = self.connect_dist * self.connect_dist
+        nodes = self.nodes
+        for i in range(len(nodes)):
+            xi, yi = nodes[i].screen_x, nodes[i].screen_y
+            for j in range(i + 1, len(nodes)):
+                dx = xi - nodes[j].screen_x
+                dy = yi - nodes[j].screen_y
+                d2 = dx * dx + dy * dy
+                if d2 < d2max:
+                    self.edges.append((i, j, d2))
+
+    def draw(self, surface, cx, cy, color, t):
+        # Synapses first, so node cells sit on top.
+        for i, j, d2 in self.edges:
+            a = self.nodes[i]
+            b = self.nodes[j]
+            closeness = 1.0 - (d2 ** 0.5) / self.connect_dist
+            depth = (a.depth + b.depth) * 0.5
+            strength = closeness * depth * 0.5
+            c = tuple(int(v * strength) for v in color)
+            pygame.draw.line(
+                surface, c,
+                (int(cx + a.screen_x), int(cy + a.screen_y)),
+                (int(cx + b.screen_x), int(cy + b.screen_y)), 1,
+            )
+        # Neuron cell bodies, flickering as they "fire".
+        for n in self.nodes:
+            fire = 0.6 + 0.4 * math.sin(t * 5 + n.fire_phase)
+            bright = n.depth * fire
+            c = tuple(int(v * bright) for v in color)
+            sz = max(1, int(n.size * (0.5 + 0.5 * n.depth)))
+            pygame.draw.circle(surface, c, (int(cx + n.screen_x), int(cy + n.screen_y)), sz)
+
+
+class Impulse:
+    """A nerve impulse that races along a synapse, then jumps to a new one."""
+
+    def __init__(self, mesh):
+        self.mesh = mesh
+        self.speed = random.uniform(1.4, 2.6)
+        self._respawn()
+
+    def _respawn(self):
+        edges = self.mesh.edges
+        if edges:
+            i, j, _ = random.choice(edges)
+            self.i, self.j = (i, j) if random.random() < 0.5 else (j, i)
+        else:
+            self.i = self.j = random.randrange(len(self.mesh.nodes))
+        self.p = 0.0
+
+    def update(self, dt):
+        self.p += self.speed * dt
+        if self.p >= 1.0:
+            self._respawn()
+
+    def draw(self, surface, cx, cy, color):
+        a = self.mesh.nodes[self.i]
+        b = self.mesh.nodes[self.j]
+        x = cx + _lerp(a.screen_x, b.screen_x, self.p)
+        y = cy + _lerp(a.screen_y, b.screen_y, self.p)
+        # small bright head only — no glowing halo
+        head = tuple(min(255, int(v + 50)) for v in color)
+        pygame.draw.circle(surface, head, (int(x), int(y)), 1)
+
+
+class Membrane:
+    """An organic, wobbling cell membrane — concentric living rings whose radius
+    breathes with a sum of sine waves instead of being a clean circle."""
+
+    def __init__(self, radius, layers=2):
+        self.radius = radius
+        self.layers = []
+        for k in range(layers):
+            self.layers.append({
+                "scale": 1.0 - k * 0.14,
+                "freqs": [random.randint(3, 7) for _ in range(3)],
+                "phases": [random.uniform(0, 2 * math.pi) for _ in range(3)],
+                "spin": random.uniform(-0.4, 0.4),
+                "amp": random.uniform(0.06, 0.12),
+            })
+
+    def draw(self, surface, cx, cy, color, chaos, pulse, t):
+        for k, lay in enumerate(self.layers):
+            base = self.radius * lay["scale"] * (1 + pulse * 0.18)
+            pts = []
+            for s in range(MEMBRANE_POINTS + 1):
+                ang = (s / MEMBRANE_POINTS) * 2 * math.pi + t * lay["spin"]
+                wob = 0.0
+                for f, ph in zip(lay["freqs"], lay["phases"]):
+                    wob += math.sin(ang * f + t * 1.6 + ph)
+                wob *= lay["amp"] * (1 + chaos * 1.8) / len(lay["freqs"])
+                r = base * (1 + wob)
+                pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+            bright = 0.35 - k * 0.1
+            c = tuple(int(v * bright) for v in color)
+            pygame.draw.lines(surface, c, False, pts, 1)
+
+
+class RadarSweep:
+    """A techno HUD shell: a rotating radar sweep with a fading wake, ringed by
+    a slowly counter-rotating band of circuit segments and tick marks."""
+
+    SWEEP_TRAIL = 14          # wedge segments trailing the sweep line
+    SEGMENTS = 32             # dashes in the outer circuit ring
+
+    def __init__(self, radius):
+        self.radius = radius
+
+    def draw(self, surface, cx, cy, color, chaos, t):
+        spd = 1.1 + chaos * 2.2
+        head = t * spd
+
+        # Sweep wake — a wedge of lines fading behind the leading edge.
+        for k in range(self.SWEEP_TRAIL):
+            ang = head - k * 0.07
+            fade = (1.0 - k / self.SWEEP_TRAIL) * 0.5
+            c = tuple(int(v * fade) for v in color)
+            ex = cx + self.radius * math.cos(ang)
+            ey = cy + self.radius * math.sin(ang)
+            pygame.draw.line(surface, c, (cx, cy), (int(ex), int(ey)), 1)
+
+        # Bright leading edge dot.
+        hx = cx + self.radius * math.cos(head)
+        hy = cy + self.radius * math.sin(head)
+        pygame.draw.circle(surface, color, (int(hx), int(hy)), 2)
+
+        # Outer circuit ring — counter-rotating dashes with tick marks.
+        ring_spin = -t * 0.25
+        seg = 2 * math.pi / self.SEGMENTS
+        for s in range(self.SEGMENTS):
+            a0 = s * seg + ring_spin
+            a1 = a0 + seg * 0.55          # dash covers ~half each slot
+            bright = 0.22 + 0.10 * math.sin(t * 2 + s)
+            c = tuple(int(v * bright) for v in color)
+            pygame.draw.line(
+                surface, c,
+                (int(cx + self.radius * math.cos(a0)), int(cy + self.radius * math.sin(a0))),
+                (int(cx + self.radius * math.cos(a1)), int(cy + self.radius * math.sin(a1))), 1,
+            )
+            # tick mark pointing inward every 4th segment
+            if s % 4 == 0:
+                tr = self.radius - 7
+                tc = tuple(int(v * 0.3) for v in color)
+                pygame.draw.line(
+                    surface, tc,
+                    (int(cx + self.radius * math.cos(a0)), int(cy + self.radius * math.sin(a0))),
+                    (int(cx + tr * math.cos(a0)), int(cy + tr * math.sin(a0))), 1,
+                )
+
+
+class IronHUD:
+    """Stark-style holographic HUD: concentric segmented arc rings spinning at
+    different rates, a fine tick scale, a center reticle, and corner targeting
+    brackets framing the whole overlay."""
+
+    # Outermost rim rings: (radius fraction, [(start_deg, span_deg)...],
+    # spin deg/s, line width, brightness). Bold outer ring + thinner arcs just
+    # beneath it spinning the opposite way.
+    OUTER_RINGS = [
+        (1.00, [(8, 70), (130, 100), (255, 40)], 9, 5, 0.7),     # bold anchor ring
+        (0.90, [(30, 50), (160, 60), (280, 45)], -20, 1, 0.85),  # thinner, opposite spin, bright
+    ]
+
+    def __init__(self, radius):
+        self.r = radius
+
+    def _arc(self, surface, color, cx, cy, rr, a0, a1, w=2):
+        rect = pygame.Rect(int(cx - rr), int(cy - rr), int(2 * rr), int(2 * rr))
+        pygame.draw.arc(surface, color, rect, a0, a1, w)
+
+    def _ring(self, surface, cx, cy, color, chaos, t, spec):
+        r_frac, segs, speed, w, bright = spec
+        rr = self.r * r_frac
+        rot = math.radians(t * speed * (1.0 + chaos * 1.5))
+        c = tuple(int(v * bright) for v in color)
+        for sdeg, span in segs:
+            a0 = math.radians(sdeg) + rot
+            self._arc(surface, c, cx, cy, rr, a0, a0 + math.radians(span), w)
+
+    def draw(self, surface, cx, cy, color, chaos, t):
+        # ---- OUTERMOST: bold + thin rim rings, sparse cardinal ticks ----
+        for spec in self.OUTER_RINGS:
+            self._ring(surface, cx, cy, color, chaos, t, spec)
+
+        rt = self.r
+        tc = tuple(int(v * 0.4) for v in color)
+        for deg in range(0, 360, 30):              # only 12 ticks, longer at 90s
+            a = math.radians(deg)
+            long = (deg % 90 == 0)
+            inner = rt - (12 if long else 6)
+            pygame.draw.line(
+                surface, tc,
+                (int(cx + rt * math.cos(a)), int(cy + rt * math.sin(a))),
+                (int(cx + inner * math.cos(a)), int(cy + inner * math.sin(a))),
+                2 if long else 1,
+            )
+
+        # ---- CENTER: two fixed-length thick arcs sliding up/down their own
+        # semicircles, meeting (colliding) at top then bottom ----
+        rr = self.r * 0.34
+        hs = math.radians(40)                       # fixed half-span (constant length)
+        swing = math.sin(t * 1.8) * math.radians(50)
+        cc = tuple(int(v * 0.8) for v in color)
+        left_c = math.radians(180) - swing
+        right_c = math.radians(0) + swing
+        self._arc(surface, cc, cx, cy, rr, left_c - hs, left_c + hs, 5)
+        self._arc(surface, cc, cx, cy, rr, right_c - hs, right_c + hs, 5)
+
+    def draw_frame(self, surface, color, t):
+        """L-shaped corner brackets framing the canvas, plus holo readouts."""
+        c = tuple(int(v * 0.4) for v in color)
+        m, ln = 12, 26
+        w, h = WIDTH, HEIGHT
+        corners = [
+            (m, m, 1, 1), (w - m, m, -1, 1),
+            (m, h - m, 1, -1), (w - m, h - m, -1, -1),
+        ]
+        for x, y, sx, sy in corners:
+            pygame.draw.line(surface, c, (x, y), (x + sx * ln, y), 1)
+            pygame.draw.line(surface, c, (x, y), (x, y + sy * ln), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -173,15 +437,22 @@ class CoreGlow:
 # ---------------------------------------------------------------------------
 
 class _Scene:
-    """Owns the particles/tendrils/core and renders frames onto a surface."""
+    """Owns the organism's parts (membrane, neural mesh, impulses, dust, core)
+    and renders one frame onto a surface."""
 
     CHAOS_MAP = {"idle": 0.0, "listening": 0.85, "processing": 0.5, "speaking": 0.35}
+    # How many nerve impulses fire at once, per state.
+    IMPULSE_MAP = {"idle": 3, "listening": 10, "processing": 7, "speaking": 8}
 
     def __init__(self):
         self.sphere_radius = int(WIDTH * 0.22)   # scales with the overlay size
         self.particles = [Particle(self.sphere_radius) for _ in range(NUM_PARTICLES)]
-        self.tendrils = [Tendril(self.sphere_radius, i, NUM_TENDRILS) for i in range(NUM_TENDRILS)]
+        self.mesh = NeuralMesh(self.sphere_radius)
+        self.container_r = int(self.sphere_radius * 1.16)   # clean circle holding the dust
+        self.hud = IronHUD(int(self.sphere_radius * 1.62))
         self.core = CoreGlow()
+        self.impulses = [Impulse(self.mesh) for _ in range(max(self.IMPULSE_MAP.values()))]
+        self.active_impulses = self.IMPULSE_MAP["idle"]
 
         pygame.font.init()
         self.font = pygame.font.SysFont("monospace", 14, bold=True)
@@ -201,6 +472,7 @@ class _Scene:
         self.state = state
         self.target_color = PALETTE.get(state, PALETTE["idle"])
         self.target_chaos = self.CHAOS_MAP.get(state, 0.0)
+        self.active_impulses = self.IMPULSE_MAP.get(state, 3)
         self.status_text = state.upper()
 
     def render(self, surface, dt, t):
@@ -225,34 +497,62 @@ class _Scene:
         surface.fill((0, 0, 0, 0))
 
         color = self.current_color
-        self.core.draw(surface, cx, cy, color, self.pulse)
 
-        for tendril in self.tendrils:
-            tendril.draw(surface, cx, cy, color, self.chaos, self.pulse, t)
+        # Back to front: container circle -> synaptic mesh -> impulses -> dust
+        # -> nucleus (additive, on top so nothing overwrites it into dark
+        # streaks) -> Stark HUD (center + rim) -> corner frame + text.
+        cr = int(self.container_r + self.pulse * 6)
+        pygame.draw.circle(surface, tuple(int(v * 0.5) for v in color), (cx, cy), cr, 2)
+        # Ring of small radial ticks surrounding the container.
+        tc = tuple(int(v * 0.6) for v in color)
+        for deg in range(0, 360, 9):
+            a = math.radians(deg)
+            ca, sa = math.cos(a), math.sin(a)
+            pygame.draw.line(
+                surface, tc,
+                (int(cx + (cr + 3) * ca), int(cy + (cr + 3) * sa)),
+                (int(cx + (cr + 9) * ca), int(cy + (cr + 9) * sa)), 1,
+            )
+
+        self.mesh.update(dt, self.chaos, self.pulse)
+        self.mesh.draw(surface, cx, cy, color, t)
+
+        for imp in self.impulses[:self.active_impulses]:
+            imp.update(dt)
+            imp.draw(surface, cx, cy, color)
 
         for p in self.particles:
             p.update(dt, self.chaos, self.pulse)
             p.draw(surface, cx, cy, color)
 
-        # Outer ring
-        ring_radius = int(self.sphere_radius + 20 + self.pulse * 12)
-        ring_color = tuple(int(v * 0.15) for v in color)
-        pygame.draw.circle(surface, ring_color, (cx, cy), ring_radius, 1)
+        # Nucleus painted last & additively — no element can carve dark lines in it.
+        self.core.draw(surface, cx, cy, color, self.pulse, t)
 
-        # Inner ring
-        inner_r = int(self.sphere_radius * 0.6 + self.pulse * 5)
-        inner_c = tuple(int(v * 0.1) for v in color)
-        pygame.draw.circle(surface, inner_c, (cx, cy), inner_r, 1)
+        self.hud.draw(surface, cx, cy, color, self.chaos, t)
+        self.hud.draw_frame(surface, color, t)
 
-        # Status text
-        status_surf = self.font.render(self.status_text, True, color)
-        sr = status_surf.get_rect(center=(cx, cy + self.sphere_radius + 45))
-        surface.blit(status_surf, sr)
+        self._draw_readouts(surface, cx, cy, color, t)
 
-        # Title
-        title_surf = self.title_font.render("J.A.R.V.I.S", True, tuple(int(v * 0.4) for v in color))
-        tr = title_surf.get_rect(center=(cx, cy - self.sphere_radius - 40))
-        surface.blit(title_surf, tr)
+    def _draw_readouts(self, surface, cx, cy, color, t):
+        """Stark-style holographic text labels around the HUD."""
+        bright = tuple(int(v * 0.85) for v in color)
+        dim = tuple(int(v * 0.45) for v in color)
+
+        # Title, top-left of frame.
+        surface.blit(self.title_font.render("J.A.R.V.I.S", True, dim), (20, 16))
+
+        # State, centered under the organism, with a leading marker.
+        label = "// " + self.status_text
+        ssurf = self.font.render(label, True, bright)
+        surface.blit(ssurf, ssurf.get_rect(center=(cx, cy + self.sphere_radius + 52)))
+
+        # Faux telemetry, bottom corners — animated so it feels live.
+        load = int(40 + 30 * (math.sin(t * 1.3) * 0.5 + 0.5) + self.chaos * 25)
+        hz = int(60 + 18 * math.sin(t * 0.7))
+        tl = self.title_font.render(f"SYS {load:02d}%", True, dim)
+        tr = self.title_font.render(f"{hz}HZ", True, dim)
+        surface.blit(tl, (20, HEIGHT - 28))
+        surface.blit(tr, tr.get_rect(topright=(WIDTH - 20, HEIGHT - 28)))
 
 
 def _surface_to_qimage(surf):
